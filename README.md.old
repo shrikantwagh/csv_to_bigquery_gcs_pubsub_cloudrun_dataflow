@@ -1,0 +1,311 @@
+# CSV → BigQuery (GCS upload → Pub/Sub → Cloud Run → Dataflow)
+
+This repo implements an end-to-end pattern:
+
+1. A **CSV** file is uploaded into a specific **Cloud Storage folder/prefix** (e.g., `incoming/`).
+2. A **Cloud Storage → Pub/Sub** notification publishes an event.
+3. A **Cloud Run** service (HTTP) receives the Pub/Sub push message, validates it, **infers the CSV schema**, creates the BigQuery table (if needed), then **launches a Dataflow job**.
+4. **Dataflow (Apache Beam)** reads the CSV from GCS, parses rows, and writes them into **BigQuery**.
+
+> Designed for “CSV drops” into a bucket/prefix where you want near-real-time ingestion with minimal ops.
+
+---
+
+## Project structure
+
+```
+csv_to_bigquery_gcs_pubsub_cloudrun_dataflow/
+  cloudrun_service/
+    main.py                  # Pub/Sub push endpoint (Cloud Run)
+    schema_inference.py      # Infer BigQuery schema from CSV sample
+    bq_utils.py              # Create dataset/table, schema helpers
+    dataflow_launcher.py     # Launch Beam pipeline on Dataflow
+    requirements.txt
+    Dockerfile
+  beam_pipeline/
+    pipeline.py              # Apache Beam pipeline: CSV -> BigQuery
+  README.md
+```
+
+---
+
+## Prerequisites
+
+- Google Cloud project with billing enabled
+- gcloud CLI authenticated
+- APIs enabled:
+  - Cloud Run
+  - Pub/Sub
+  - Cloud Storage
+  - Dataflow
+  - BigQuery
+
+Enable APIs:
+
+```bash
+gcloud services enable \
+  run.googleapis.com \
+  pubsub.googleapis.com \
+  storage.googleapis.com \
+  dataflow.googleapis.com \
+  bigquery.googleapis.com
+```
+
+---
+
+## 1) Create resources (bucket, topic, dataset)
+
+gcloud services enable \
+  run.googleapis.com \
+  pubsub.googleapis.com \
+  storage.googleapis.com \
+  dataflow.googleapis.com \
+  bigquery.googleapis.com
+
+Set variables:
+
+```bash
+export PROJECT_ID="YOUR_PROJECT_ID"
+export REGION="us-central1"
+export BUCKET="YOUR_BUCKET_NAME"          # globally unique
+export PREFIX="incoming/"                 # folder/prefix to watch
+export TOPIC="csv-ingest-topic"
+export SUB="csv-ingest-push-sub"
+export BQ_DATASET="csv_ingest"
+export TABLE_PREFIX="csv_"                # optional; table name becomes csv_<file_stem>
+```
+
+Create bucket:
+
+```bash
+gcloud storage buckets create gs://$BUCKET --project=$PROJECT_ID --location=$REGION
+```
+
+Create Pub/Sub topic:
+
+```bash
+gcloud pubsub topics create $TOPIC --project=$PROJECT_ID
+```
+
+Create BigQuery dataset:
+
+```bash
+bq --project_id=$PROJECT_ID mk --dataset --location=$REGION $BQ_DATASET
+```
+
+---
+
+## 2) Create a Cloud Storage notification to Pub/Sub
+
+Cloud Storage notifications publish object finalize events to Pub/Sub.
+
+```bash
+gsutil notification create \
+  -t projects/$PROJECT_ID/topics/$TOPIC \
+  -f json \
+  -e OBJECT_FINALIZE \
+  gs://$BUCKET
+```
+
+> Note: Cloud Storage notifications do not filter by prefix; we handle prefix filtering in Cloud Run.
+
+---
+
+## 3) Deploy Cloud Run service
+
+### 3.1 Configure a service account for Cloud Run
+
+Cloud Run needs to:
+- Read objects from GCS
+- Create BigQuery tables
+- Launch Dataflow jobs
+
+```bash
+export CR_SA="csv-ingest-cloudrun-sa"
+gcloud iam service-accounts create $CR_SA --project=$PROJECT_ID
+export CR_SA_EMAIL="$CR_SA@$PROJECT_ID.iam.gserviceaccount.com"
+```
+
+Grant permissions (keep it simple for a POC; tighten later):
+
+```bash
+# GCS read
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$CR_SA_EMAIL" \
+  --role="roles/storage.objectViewer"
+
+# BigQuery dataset/table create + write
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$CR_SA_EMAIL" \
+  --role="roles/bigquery.dataEditor"
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$CR_SA_EMAIL" \
+  --role="roles/bigquery.user"
+
+# Dataflow job launch
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$CR_SA_EMAIL" \
+  --role="roles/dataflow.developer"
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$CR_SA_EMAIL" \
+  --role="roles/iam.serviceAccountUser"
+```
+
+gcloud projects describe $PROJECT_ID --format="value(projectNumber)"
+
+
+### 3.2 Build and deploy
+
+From repo root:
+
+```bash
+gcloud run deploy csv-to-bq-ingester \
+  --project=$PROJECT_ID \
+  --region=$REGION \
+  --source=./cloudrun_service \
+  --service-account=$CR_SA_EMAIL \
+  --allow-unauthenticated \
+  --set-env-vars=PROJECT_ID=$PROJECT_ID,REGION=$REGION,BUCKET=$BUCKET,PREFIX=$PREFIX,BQ_DATASET=$BQ_DATASET,TABLE_PREFIX=$TABLE_PREFIX,DF_TEMP_LOCATION=gs://$BUCKET/dataflow/temp,DF_STAGING_LOCATION=gs://$BUCKET/dataflow/staging
+```
+
+Grab the Cloud Run URL:
+
+```bash
+export CR_URL="$(gcloud run services describe csv-to-bq-ingester --region=$REGION --project=$PROJECT_ID --format='value(status.url)')"
+echo $CR_URL
+```
+
+---
+
+## 4) Create a Pub/Sub push subscription to Cloud Run
+
+Pub/Sub will POST messages to your Cloud Run URL.
+
+```bash
+gcloud pubsub subscriptions create $SUB \
+  --project=$PROJECT_ID \
+  --topic=$TOPIC \
+  --push-endpoint="$CR_URL/" \
+  --push-auth-service-account=$CR_SA_EMAIL
+```
+
+> Using `--push-auth-service-account` enables authenticated push via OIDC.
+
+---
+
+## 5) Test it
+
+Upload a CSV into the watched prefix:
+
+```bash
+gcloud storage cp ./sample.csv gs://$BUCKET/$PREFIX/sample.csv
+```
+
+Then check logs:
+
+```bash
+gcloud run services logs read csv-to-bq-ingester --region=$REGION --project=$PROJECT_ID
+```
+
+You should see:
+- object details (bucket/object)
+- inferred schema
+- a Dataflow job id
+
+Check Dataflow UI and BigQuery table:
+- dataset: `$BQ_DATASET`
+- table: `$TABLE_PREFIX<file_stem>` (e.g., `csv_sample`)
+
+---
+
+## Configuration (env vars)
+
+Cloud Run uses these environment variables:
+
+| Variable | Required | Example | Purpose |
+|---|---:|---|---|
+| `PROJECT_ID` | ✅ | `my-proj` | GCP project |
+| `REGION` | ✅ | `us-central1` | Dataflow region |
+| `BUCKET` | ✅ | `my-bucket` | Bucket name to accept events for |
+| `PREFIX` | ✅ | `incoming/` | Only process objects under this prefix |
+| `BQ_DATASET` | ✅ | `csv_ingest` | Destination dataset |
+| `TABLE_PREFIX` | ❌ | `csv_` | Table name prefix |
+| `DF_TEMP_LOCATION` | ✅ | `gs://.../dataflow/temp` | Dataflow temp location |
+| `DF_STAGING_LOCATION` | ✅ | `gs://.../dataflow/staging` | Dataflow staging location |
+| `DATAFLOW_SA_EMAIL` | ❌ | `...@...` | (Optional) service account for Dataflow workers |
+
+---
+
+## Notes / production hardening ideas
+
+- Add a dead-letter topic and retry policy for Pub/Sub push.
+- Add a schema registry (don’t infer every time), or infer once per table and enforce afterwards.
+- Support partitioning/clustering and table naming rules.
+- Handle quoted delimiters, encodings, very wide rows.
+- Use a Dataflow Flex Template for lighter Cloud Run images (Beam deps can be heavy).
+
+---
+
+## License
+
+MIT (example).
+
+(.venv) ) shrikantwagh@macbookpro csv_to_bigquery_gcs_pubsub_cloudrun_dataflow % gcloud dataflow jobs list \
+  --region=us-central1 \
+  --project=acoustic-agent-466216-m7 \
+  --status=active
+
+JOB_ID                                   NAME                       TYPE   CREATION_TIME        STATE    REGION
+2026-01-06_10_36_57-3704646860119189512  csv-to-bq-20260106-183648  Batch  2026-01-06 18:36:58  Pending  us-central1
+((.venv) ) shrikantwagh@macbookpro csv_to_bigquery_gcs_pubsub_cloudrun_dataflow % gcloud dataflow jobs cancel 2026-01-06_10_36_57-3704646860119189512 \
+  --region=us-central1 \
+  --project=acoustic-agent-466216-m7
+
+Cancelled job [2026-01-06_10_36_57-3704646860119189512]
+
+
+6-01-06_10_36_57-3704646860119189512  csv-to-bq-20260106-183648  Batch  2026-01-06 18:36:58  Cancelling  us-central1
+((.venv) ) shrikantwagh@macbookpro csv_to_bigquery_gcs_pubsub_cloudrun_dataflow % gcloud pubsub subscriptions list --project=acoustic-agent-466216-m7
+
+---
+ackDeadlineSeconds: 10
+expirationPolicy:
+  ttl: 2678400s
+messageRetentionDuration: 604800s
+name: projects/acoustic-agent-466216-m7/subscriptions/csv-ingest-push-sub
+pushConfig:
+  attributes:
+    x-goog-version: v1
+  oidcToken:
+    serviceAccountEmail: csv-ingest-cloudrun-sa@acoustic-agent-466216-m7.iam.gserviceaccount.com
+  pushEndpoint: https://csv-to-bq-ingester-j2u4w456la-uc.a.run.app/
+state: ACTIVE
+topic: projects/acoustic-agent-466216-m7/topics/csv-ingest-topic
+
+
+((.venv) ) shrikantwagh@macbookpro csv_to_bigquery_gcs_pubsub_cloudrun_dataflow % gcloud pubsub subscriptions delete csv-ingest-push-sub \
+  --project=acoustic-agent-466216-m7
+
+Deleted subscription [projects/acoustic-agent-466216-m7/subscriptions/csv-ingest-push-sub].
+
+gcloud run services delete csv-to-bq-ingester \
+  --region=us-central1 \
+  --project=acoustic-agent-466216-m7
+
+((.venv) ) shrikantwagh@macbookpro csv_to_bigquery_gcs_pubsub_cloudrun_dataflow % gsutil notification list gs://test-data-embeddings
+
+projects/_/buckets/test-data-embeddings/notificationConfigs/2
+        Cloud Pub/Sub topic: projects/acoustic-agent-466216-m7/topics/csv-ingest-topic
+        Filters:
+                Event Types: OBJECT_FINALIZE
+
+
+
+gsutil notification delete projects/_/buckets/test-data-embeddings/notificationConfigs/2
+
+((.venv) ) shrikantwagh@macbookpro csv_to_bigquery_gcs_pubsub_cloudrun_dataflow % gcloud dataflow jobs list \
+  --region=us-central1 \
+  --project=acoustic-agent-466216-m7 \
+  --status=active
+
+Listed 0 items.

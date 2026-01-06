@@ -1,0 +1,43 @@
+# -------------------------------------------------------------------
+# Cloud Run HTTP handler (Pub/Sub push)
+# -------------------------------------------------------------------
+functions-framework==3.7.0
+# Exposes an HTTP endpoint in Cloud Run compatible with Pub/Sub push
+
+
+# -------------------------------------------------------------------
+# Google Cloud clients (used by Cloud Run orchestration layer)
+# -------------------------------------------------------------------
+google-cloud-storage==2.16.0
+# Read CSV headers / samples from GCS for schema inference
+
+google-cloud-bigquery==3.25.0
+# Create datasets/tables and manage BigQuery metadata
+
+google-api-core==2.19.1
+# Shared Google API retry / exception handling (dependency-safe pin)
+
+
+# -------------------------------------------------------------------
+# Apache Beam + Dataflow
+# -------------------------------------------------------------------
+apache-beam[gcp]==2.57.0
+# Required to submit and run Dataflow jobs (CSV -> BigQuery)
+# Includes BigQueryIO, GCS IO, and DataflowRunner
+
+
+# -------------------------------------------------------------------
+# CSV schema inference helpers
+# -------------------------------------------------------------------
+python-dateutil==2.9.0.post0
+# Robust parsing of DATE / TIMESTAMP fields from CSV samples
+
+
+# -------------------------------------------------------------------
+# Optional but recommended (stability + logging)
+# -------------------------------------------------------------------
+protobuf>=4.25.3
+# Prevents Beam / BigQuery protobuf version conflicts
+
+grpcio>=1.62.0
+# Required by BigQuery + Dataflow APIs
